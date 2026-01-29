@@ -64,8 +64,8 @@ class TorchSimStaticProfile(BaseModel):
 class AseStaticProfile(BaseModel):
     """Timing breakdown for one ASE static profile run (same job as TorchSim)."""
 
-    setup: float  # copy atoms + attach calculator
-    model_loop: float  # get_potential_energy + get_forces + get_stress for each
+    setup: float
+    model_loop: float
     total: float
 
 
@@ -107,7 +107,6 @@ def profile_torchsim_static(n: int, base_structure: typing.Any) -> TorchSimStati
     batcher.load_states(state)
     t_load = time.perf_counter() - t0
 
-    # Single run for total model_loop time (one sync at end so GPU can overlap work).
     t0 = time.perf_counter()
     get_batch_times: list[float] = []
     model_times: list[float] = []
@@ -128,7 +127,6 @@ def profile_torchsim_static(n: int, base_structure: typing.Any) -> TorchSimStati
     t_loop_elapsed = time.perf_counter() - t0
     t_loop_get_batch = sum(get_batch_times)
     t_loop_forward = sum(model_times)
-    # First breakdown bar = sum of model_loop breakdown plot (get_batch + forward).
     model_loop = t_loop_get_batch + t_loop_forward
     total = t_init + t_load + model_loop
 
