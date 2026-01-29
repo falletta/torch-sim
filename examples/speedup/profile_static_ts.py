@@ -51,6 +51,51 @@ class TorchSimStaticProfile(BaseModel):
     n_batches: float
 
 
+def run_torchsim_static(
+    n_structures_list: list[int],
+    base_structure: typing.Any,
+) -> list[float]:
+    """Load TorchSim model once, run static for each n using O(1)
+    batched path, return timings.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    loaded_model = mace_mp(
+        model=MaceUrls.mace_mpa_medium,
+        return_raw_model=True,
+        default_dtype="float64",
+        device=str(device),
+    )
+    model = MaceModel(
+        model=typing.cast("torch.nn.Module", loaded_model),
+        device=device,
+        compute_forces=True,
+        compute_stress=True,
+        dtype=torch.float64,
+        enable_cueq=False,
+    )
+    batcher = ts.BinningAutoBatcher(
+        model=model,
+        max_memory_scaler=400_000,
+        memory_scales_with="n_atoms_x_density",
+        pre_concatenate_batches=True,
+    )
+    times: list[float] = []
+    for n in n_structures_list:
+        structures = [base_structure.copy() for _ in range(n)]
+        t0 = time.perf_counter()
+        state = ts.initialize_state(structures, model.device, model.dtype)
+        batcher.load_states(state)
+        for sub_state, _ in batcher:
+            model(sub_state)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+        elapsed = time.perf_counter() - t0
+        times.append(elapsed)
+        print(f"  n={n} static_time={elapsed:.6f}s")
+    return times
+
+
 def profile_torchsim_static(n: int, base_structure: typing.Any) -> TorchSimStaticProfile:  # noqa: C901, PLR0915
     """Time initialize_state, load_states, and model loop separately for one n.
 
@@ -207,8 +252,13 @@ def plot_profile_sweep(
     timings_by_n: list[TorchSimStaticProfile],
     n_list: list[int],
     output_path: str = "profile_static.html",
+    sweep_totals: list[float] | None = None,
 ) -> None:
-    """Single HTML: main phases, load_states/model_loop breakdowns, total vs n."""
+    """Single HTML: main phases, load_states/model_loop breakdowns, total vs n.
+
+    If sweep_totals is provided (from run_torchsim_static), adds a second line on
+    the total-time subplot for comparison.
+    """
     phases = ["initialize_state", "load_states", "model_loop"]
     colors = {
         "initialize_state": "#2ca02c",
@@ -308,11 +358,26 @@ def plot_profile_sweep(
             textposition="top center",
             line={"width": 2},
             marker={"size": 12},
-            name="TorchSim total",
+            name="TorchSim total (profile)",
         ),
         row=4,
         col=1,
     )
+    if sweep_totals is not None and len(sweep_totals) == len(n_list):
+        fig.add_trace(
+            go.Scatter(
+                x=x_centers,
+                y=sweep_totals,
+                mode="lines+markers+text",
+                text=[f"{t:.2f}s" for t in sweep_totals],
+                textposition="bottom center",
+                line={"width": 2},
+                marker={"size": 12},
+                name="TorchSim total (sweep)",
+            ),
+            row=4,
+            col=1,
+        )
 
     tickvals = dict(tickvals=x_centers, ticktext=[str(n) for n in n_list])
     for row in range(1, 5):
@@ -337,6 +402,10 @@ if __name__ == "__main__":
     print(f"torch_sim from: {ts.__file__}")
     mgo_ase = bulk(name="MgO", crystalstructure="rocksalt", a=4.21, cubic=True)
     base_structure = AseAtomsAdaptor.get_structure(atoms=mgo_ase)  # pyright: ignore[reportArgumentType]
+
+    # Run torch_sim static for comparison; add sweep totals to the plot
+    sweep_totals = run_torchsim_static(N_STRUCTURES, base_structure)
+
     timings_by_n = [
         profile_torchsim_static(n_val, base_structure) for n_val in N_STRUCTURES
     ]
@@ -344,4 +413,5 @@ if __name__ == "__main__":
         timings_by_n,
         N_STRUCTURES,
         output_path="profile_static.html",
+        sweep_totals=sweep_totals,
     )
