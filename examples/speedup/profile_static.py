@@ -107,14 +107,33 @@ def profile_torchsim_static(n: int, base_structure: typing.Any) -> TorchSimStati
     batcher.load_states(state)
     t_load = time.perf_counter() - t0
 
+    # Single run for total model_loop time (one sync at end so GPU can overlap work).
     t0 = time.perf_counter()
-    for sub_state, _ in batcher:
-        model(sub_state)
+    get_batch_times: list[float] = []
+    model_times: list[float] = []
+    it = iter(batcher)
+    t_prev = t0
+    while True:
+        try:
+            sub_state, _ = next(it)
+            t_after_get = time.perf_counter()
+            get_batch_times.append(t_after_get - t_prev)
+            model(sub_state)
+            t_prev = time.perf_counter()
+            model_times.append(t_prev - t_after_get)
+        except StopIteration:
+            break
     if device.type == "cuda":
         torch.cuda.synchronize()
-    t_loop = time.perf_counter() - t0
+    t_loop_elapsed = time.perf_counter() - t0
+    t_loop_get_batch = sum(get_batch_times)
+    t_loop_forward = sum(model_times)
+    # First breakdown bar = sum of model_loop breakdown plot (get_batch + forward).
+    model_loop = t_loop_get_batch + t_loop_forward
+    total = t_init + t_load + model_loop
 
-    total = t_init + t_load + t_loop
+    if t_loop_elapsed < model_loop - 1e-9:
+        raise ValueError("elapsed loop time must be >= breakdown sum")
 
     t0 = time.perf_counter()
     state_slices = state.split() if isinstance(state, ts.SimState) else list(state)
@@ -138,27 +157,6 @@ def profile_torchsim_static(n: int, base_structure: typing.Any) -> TorchSimStati
     if device.type == "cuda":
         torch.cuda.synchronize()
     t_load_binning = time.perf_counter() - t0
-
-    batcher.load_states(state)
-    get_batch_times: list[float] = []
-    model_times: list[float] = []
-    it = iter(batcher)
-    while True:
-        try:
-            t0 = time.perf_counter()
-            sub_state, _ = next(it)
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            get_batch_times.append(time.perf_counter() - t0)
-            t0 = time.perf_counter()
-            model(sub_state)
-            if device.type == "cuda":
-                torch.cuda.synchronize()
-            model_times.append(time.perf_counter() - t0)
-        except StopIteration:
-            break
-    t_loop_get_batch = sum(get_batch_times)
-    t_loop_forward = sum(model_times)
 
     batcher.load_states(state)
     sub_state, _ = next(iter(batcher))
@@ -207,7 +205,7 @@ def profile_torchsim_static(n: int, base_structure: typing.Any) -> TorchSimStati
         load_states_split=t_load_split,
         load_states_memory_scalers=t_load_scalers,
         load_states_binning=t_load_binning,
-        model_loop=t_loop,
+        model_loop=model_loop,
         model_loop_get_batch=t_loop_get_batch,
         model_loop_forward=t_loop_forward,
         total=total,
