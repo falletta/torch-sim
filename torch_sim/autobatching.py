@@ -322,6 +322,38 @@ def determine_max_batch_size(
     return sizes[-1]
 
 
+def calculate_memory_scalers(
+    state: SimState,
+    memory_scales_with: MemoryScaling = "n_atoms_x_density",
+) -> list[float]:
+    """Compute memory scalers for all systems in a batched state in O(n_systems).
+
+    Uses only state.n_atoms_per_system and state.volume (no split, no position
+    scan). Use this instead of a loop over calculate_memory_scaler when you need
+    scalers for a batched state.
+
+    Args:
+        state: Batched SimState (n_systems >= 1).
+        memory_scales_with: Same as in calculate_memory_scaler.
+
+    Returns:
+        list[float]: One scaler per system, length state.n_systems.
+    """
+    if memory_scales_with == "n_atoms":
+        return state.n_atoms_per_system.tolist()
+    if memory_scales_with == "n_atoms_x_density":
+        n_per = state.n_atoms_per_system.to(state.volume.dtype)
+        vol_nm3 = torch.abs(state.volume) / 1000  # A^3 -> nm^3
+        # Where volume <= 0, use n_atoms (non-periodic/degenerate cell)
+        safe_vol = torch.where(vol_nm3 > 0, vol_nm3, torch.ones_like(vol_nm3))
+        scalers = n_per * (n_per / safe_vol)
+        scalers = torch.where(vol_nm3 > 0, scalers, n_per)
+        return scalers.tolist()
+    raise ValueError(
+        f"Invalid metric: {memory_scales_with}, must be one of {get_args(MemoryScaling)}"
+    )
+
+
 def calculate_memory_scaler(
     state: SimState,
     memory_scales_with: MemoryScaling = "n_atoms_x_density",
@@ -359,20 +391,17 @@ def calculate_memory_scaler(
         metric = calculate_memory_scaler(state, memory_scales_with="n_atoms_x_density")
     """
     if state.n_systems > 1:
-        return sum(calculate_memory_scaler(s, memory_scales_with) for s in state.split())
+        return sum(calculate_memory_scalers(state, memory_scales_with))
     if memory_scales_with == "n_atoms":
         return state.n_atoms
     if memory_scales_with == "n_atoms_x_density":
-        if all(state.pbc):
-            volume = torch.abs(torch.linalg.det(state.cell[0])) / 1000
-        else:
-            bbox = state.positions.max(dim=0).values - state.positions.min(dim=0).values
-            # add 2 A in non-periodic directions to account for 2D systems and slabs
-            for i, periodic in enumerate(state.pbc):
-                if not periodic:
-                    bbox[i] += 2.0
-            volume = bbox.prod() / 1000  # convert A^3 to nm^3
-        number_density = state.n_atoms / volume.item()
+        # Use cell volume (O(1)); SimState always has a cell. Avoids O(N) position scan.
+        volume_nm3 = torch.abs(state.volume[0]) / 1000  # A^3 -> nm^3
+        vol = volume_nm3.item()
+        if vol <= 0:
+            # Non-periodic or degenerate cell: fall back to n_atoms to stay O(1)
+            return state.n_atoms
+        number_density = state.n_atoms / vol
         return state.n_atoms * number_density
     raise ValueError(
         f"Invalid metric: {memory_scales_with}, must be one of {get_args(MemoryScaling)}"
@@ -491,6 +520,7 @@ class BinningAutoBatcher[T: SimState]:
         memory_scaling_factor: float = 1.6,
         max_memory_padding: float = 1.0,
         oom_error_message: str | list[str] = "CUDA out of memory",
+        pre_concatenate_batches: bool = True,
     ) -> None:
         """Initialize the binning auto-batcher.
 
@@ -515,8 +545,15 @@ class BinningAutoBatcher[T: SimState]:
             oom_error_message (str | list[str]): String or list of strings to match in
                 RuntimeError messages to identify out-of-memory errors. Defaults to
                 "CUDA out of memory".
+            pre_concatenate_batches (bool): If True, concatenate all batches in
+                load_states so next_batch() is O(1), but all batch states stay in
+                memory and can increase memory pressure and slow the forward pass.
+                If False, concatenate on demand in next_batch(); only one batch is
+                in memory at a time, so forward is not slowed by holding all batches.
+                Defaults to True.
         """
         self.max_memory_scaler = max_memory_scaler
+        self.pre_concatenate_batches = pre_concatenate_batches
         self.max_atoms_to_try = max_atoms_to_try
         self.memory_scales_with = memory_scales_with
         self.model = model
@@ -556,11 +593,17 @@ class BinningAutoBatcher[T: SimState]:
             This method resets the current state bin index, so any ongoing iteration
             will be restarted when this method is called.
         """
-        self.state_slices = states.split() if isinstance(states, SimState) else states
-        self.memory_scalers = [
-            calculate_memory_scaler(state_slice, self.memory_scales_with)
-            for state_slice in self.state_slices
-        ]
+        if isinstance(states, SimState):
+            self.memory_scalers = calculate_memory_scalers(
+                states, self.memory_scales_with
+            )
+            self.state_slices = states.split()
+        else:
+            self.state_slices = states
+            self.memory_scalers = [
+                calculate_memory_scaler(s, self.memory_scales_with)
+                for s in self.state_slices
+            ]
         if not self.max_memory_scaler:
             self.max_memory_scaler = estimate_max_memory_scaler(
                 self.state_slices,
@@ -592,10 +635,14 @@ class BinningAutoBatcher[T: SimState]:
         self.batched_states = []
         for index_bin in self.index_bins:
             self.batched_states.append([self.state_slices[idx] for idx in index_bin])
-        # Pre-concatenate so next_batch() is O(1) instead of concatenating in the loop
-        self._concatenated_batches = [
-            ts.concatenate_states(state_bin) for state_bin in self.batched_states
-        ]
+        # Optionally pre-concatenate so next_batch() is O(1); if False, only one batch
+        # in memory at a time (concat on demand), avoiding extra memory pressure.
+        if self.pre_concatenate_batches:
+            self._concatenated_batches = [
+                ts.concatenate_states(state_bin) for state_bin in self.batched_states
+            ]
+        else:
+            self._concatenated_batches = None
         self.current_state_bin = 0
 
         return self.max_memory_scaler
@@ -623,7 +670,11 @@ class BinningAutoBatcher[T: SimState]:
         # TODO: need to think about how this intersects with reporting too
         # TODO: definitely a clever treatment to be done with iterators here
         if self.current_state_bin < len(self.batched_states):
-            state = self._concatenated_batches[self.current_state_bin]
+            if self._concatenated_batches is not None:
+                state = self._concatenated_batches[self.current_state_bin]
+            else:
+                state_bin = self.batched_states[self.current_state_bin]
+                state = ts.concatenate_states(state_bin)
             indices = (
                 self.index_bins[self.current_state_bin]
                 if self.current_state_bin < len(self.index_bins)
