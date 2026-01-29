@@ -9,6 +9,7 @@ Output: profile_static.html (single file with all plots)
 # dependencies = [
 #     "torch_sim_atomistic[mace,test]",
 #     "plotly",
+#     "pydantic",
 # ]
 # ///
 
@@ -17,13 +18,15 @@ import typing
 import warnings
 
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import torch
 from ase.build import bulk
 from mace.calculators.foundations_models import mace_mp
+from plotly.subplots import make_subplots
+from pydantic import BaseModel
 from pymatgen.io.ase import AseAtomsAdaptor
 
 import torch_sim as ts
+from torch_sim.autobatching import calculate_memory_scaler, to_constant_volume_bins
 from torch_sim.models.mace import MaceModel, MaceUrls
 
 
@@ -38,12 +41,29 @@ warnings.filterwarnings(
 )
 
 
-def profile_torchsim_static(n: int, base_structure: typing.Any) -> dict[str, float]:
+class StaticProfileResult(BaseModel):
+    """Timing breakdown for one static profile run."""
+
+    initialize_state: float
+    load_states: float
+    load_states_split: float
+    load_states_memory_scalers: float
+    load_states_binning: float
+    model_loop: float
+    model_loop_get_batch: float
+    model_loop_forward: float
+    total: float
+    neighbor_list: float
+    cell_shifts: float
+    mace_forward: float
+    n_batches: float
+
+
+def profile_torchsim_static(n: int, base_structure: typing.Any) -> StaticProfileResult:  # noqa: C901, PLR0915
     """Time initialize_state, load_states, and model loop separately for one n.
 
     Returns:
-        Dict with keys: initialize_state, load_states, model_loop, total,
-        neighbor_list, cell_shifts, mace_forward, n_batches (as float).
+        StaticProfileResult with timing fields.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     loaded_model = mace_mp(
@@ -85,11 +105,50 @@ def profile_torchsim_static(n: int, base_structure: typing.Any) -> dict[str, flo
     t_loop = time.perf_counter() - t0
 
     total = t_init + t_load + t_loop
-    print(f"n={n} profile:")
-    print(f"  initialize_state: {t_init:.4f}s ({100 * t_init / total:.1f}%)")
-    print(f"  load_states:       {t_load:.4f}s ({100 * t_load / total:.1f}%)")
-    print(f"  model loop:        {t_loop:.4f}s ({100 * t_loop / total:.1f}%)")
-    print(f"  total:             {total:.4f}s")
+
+    t0 = time.perf_counter()
+    state_slices = state.split() if isinstance(state, ts.SimState) else list(state)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t_load_split = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    memory_scalers = [
+        calculate_memory_scaler(s, batcher.memory_scales_with) for s in state_slices
+    ]
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t_load_scalers = time.perf_counter() - t0
+    index_to_scaler = dict(enumerate(memory_scalers))
+    t0 = time.perf_counter()
+    index_bins = to_constant_volume_bins(
+        index_to_scaler, max_volume=batcher.max_memory_scaler
+    )
+    index_bins = [list(batch.keys()) for batch in index_bins]
+    _ = [[state_slices[i] for i in bin_idx] for bin_idx in index_bins]
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t_load_binning = time.perf_counter() - t0
+
+    batcher.load_states(state)
+    get_batch_times: list[float] = []
+    model_times: list[float] = []
+    it = iter(batcher)
+    while True:
+        try:
+            t0 = time.perf_counter()
+            sub_state, _ = next(it)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            get_batch_times.append(time.perf_counter() - t0)
+            t0 = time.perf_counter()
+            model(sub_state)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            model_times.append(time.perf_counter() - t0)
+        except StopIteration:
+            break
+    t_loop_get_batch = sum(get_batch_times)
+    t_loop_forward = sum(model_times)
 
     batcher.load_states(state)
     sub_state, _ = next(iter(batcher))
@@ -131,48 +190,72 @@ def profile_torchsim_static(n: int, base_structure: typing.Any) -> dict[str, flo
         torch.cuda.synchronize()
     t_fwd = time.perf_counter() - t_fwd
     n_batches = len(batcher.index_bins)
-    print(f"  (first batch: neighbor_list={t_nl:.4f}s, "
-          f"cell_shifts={t_shifts:.4f}s, mace_forward={t_fwd:.4f}s; n_batches={n_batches})")
 
-    return {
-        "initialize_state": t_init,
-        "load_states": t_load,
-        "model_loop": t_loop,
-        "total": total,
-        "neighbor_list": t_nl,
-        "cell_shifts": t_shifts,
-        "mace_forward": t_fwd,
-        "n_batches": float(n_batches),
-    }
+    return StaticProfileResult(
+        initialize_state=t_init,
+        load_states=t_load,
+        load_states_split=t_load_split,
+        load_states_memory_scalers=t_load_scalers,
+        load_states_binning=t_load_binning,
+        model_loop=t_loop,
+        model_loop_get_batch=t_loop_get_batch,
+        model_loop_forward=t_loop_forward,
+        total=total,
+        neighbor_list=t_nl,
+        cell_shifts=t_shifts,
+        mace_forward=t_fwd,
+        n_batches=float(n_batches),
+    )
 
 
 N_STRUCTURES = [1, 1, 10, 100, 500]
 
 
 def plot_profile_sweep(
-    timings_by_n: list[dict[str, float]],
+    timings_by_n: list[StaticProfileResult],
     n_list: list[int],
     output_path: str = "profile_static.html",
 ) -> None:
-    """Single HTML: grouped bar (phase breakdown by n) + total time vs n."""
+    """Single HTML: main phases, load_states/model_loop breakdowns, total vs n."""
     phases = ["initialize_state", "load_states", "model_loop"]
-    colors = {"initialize_state": "#2ca02c", "load_states": "#ff7f0e", "model_loop": "#1f77b4"}
+    colors = {
+        "initialize_state": "#2ca02c",
+        "load_states": "#ff7f0e",
+        "model_loop": "#1f77b4",
+    }
+    load_phases = [
+        "load_states_split",
+        "load_states_memory_scalers",
+        "load_states_binning",
+    ]
+    load_colors = {
+        "load_states_split": "#8c564b",
+        "load_states_memory_scalers": "#e377c2",
+        "load_states_binning": "#bcbd22",
+    }
+    loop_phases = ["model_loop_get_batch", "model_loop_forward"]
+    loop_colors = {"model_loop_get_batch": "#17becf", "model_loop_forward": "#1f77b4"}
     n_cats = len(n_list)
     x_centers = list(range(n_cats))
     offset = 0.25
     bar_width = 0.2
 
     fig = make_subplots(
-        rows=2,
+        rows=4,
         cols=1,
-        subplot_titles=("Profile breakdown by n_structures", "Total time vs n_structures"),
-        vertical_spacing=0.12,
+        subplot_titles=(
+            "Profile breakdown by n_structures",
+            "load_states breakdown",
+            "model_loop breakdown",
+            "Total time vs n_structures",
+        ),
+        vertical_spacing=0.08,
     )
 
     for i, phase in enumerate(phases):
         phase_offset = offset * (i - 1)
         x_pos = [c + phase_offset for c in x_centers]
-        y = [t[phase] for t in timings_by_n]
+        y = [getattr(t, phase) for t in timings_by_n]
         fig.add_trace(
             go.Bar(
                 name=phase,
@@ -187,7 +270,43 @@ def plot_profile_sweep(
             col=1,
         )
 
-    totals = [t["total"] for t in timings_by_n]
+    for i, phase in enumerate(load_phases):
+        phase_offset = offset * (i - 1)
+        x_pos = [c + phase_offset for c in x_centers]
+        y = [getattr(t, phase, 0.0) for t in timings_by_n]
+        fig.add_trace(
+            go.Bar(
+                name=phase.replace("load_states_", ""),
+                x=x_pos,
+                y=y,
+                marker_color=load_colors[phase],
+                text=[f"{v:.3f}s" for v in y],
+                textposition="outside",
+                width=bar_width,
+            ),
+            row=2,
+            col=1,
+        )
+
+    for i, phase in enumerate(loop_phases):
+        phase_offset = offset * (i - 0.5)
+        x_pos = [c + phase_offset for c in x_centers]
+        y = [getattr(t, phase, 0.0) for t in timings_by_n]
+        fig.add_trace(
+            go.Bar(
+                name=phase.replace("model_loop_", ""),
+                x=x_pos,
+                y=y,
+                marker_color=loop_colors[phase],
+                text=[f"{v:.3f}s" for v in y],
+                textposition="outside",
+                width=bar_width,
+            ),
+            row=3,
+            col=1,
+        )
+
+    totals = [t.total for t in timings_by_n]
     fig.add_trace(
         go.Scatter(
             x=x_centers,
@@ -199,36 +318,32 @@ def plot_profile_sweep(
             marker={"size": 12},
             name="total",
         ),
-        row=2,
+        row=4,
         col=1,
     )
 
-    fig.update_xaxes(
-        title_text="n_structures",
-        row=1,
-        col=1,
-        tickvals=x_centers,
-        ticktext=[str(n) for n in n_list],
-    )
-    fig.update_yaxes(title_text="Time (s)", row=1, col=1)
-    fig.update_xaxes(
-        title_text="n_structures",
-        row=2,
-        col=1,
-        tickvals=x_centers,
-        ticktext=[str(n) for n in n_list],
-    )
-    fig.update_yaxes(title_text="Time (s)", row=2, col=1)
+    tickvals = dict(tickvals=x_centers, ticktext=[str(n) for n in n_list])
+    for row in range(1, 5):
+        fig.update_xaxes(title_text="n_structures", row=row, col=1, **tickvals)
+        fig.update_yaxes(title_text="Time (s)", row=row, col=1)
     fig.update_layout(
-        height=700,
-        legend={"x": 0.01, "y": 0.99},
+        height=1000,
+        legend={
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "center",
+            "x": 0.5,
+        },
+        margin=dict(t=120),
     )
     fig.write_html(output_path)
-    print(f"Wrote {output_path}")
 
 
 if __name__ == "__main__":
     mgo_ase = bulk(name="MgO", crystalstructure="rocksalt", a=4.21, cubic=True)
     base_structure = AseAtomsAdaptor.get_structure(atoms=mgo_ase)  # pyright: ignore[reportArgumentType]
-    timings_by_n = [profile_torchsim_static(n_val, base_structure) for n_val in N_STRUCTURES]
+    timings_by_n = [
+        profile_torchsim_static(n_val, base_structure) for n_val in N_STRUCTURES
+    ]
     plot_profile_sweep(timings_by_n, N_STRUCTURES, output_path="profile_static.html")
