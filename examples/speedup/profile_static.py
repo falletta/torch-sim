@@ -16,6 +16,7 @@ from ase.build import bulk
 from mace.calculators.foundations_models import mace_mp
 from plotly.subplots import make_subplots
 from pydantic import BaseModel
+from pymatgen.core import Structure
 from pymatgen.io.ase import AseAtomsAdaptor
 
 import torch_sim as ts
@@ -87,7 +88,7 @@ def profile_torchsim_static(n: int, base_structure: typing.Any) -> TorchSimStati
         memory_scales_with="n_atoms_x_density",
         pre_concatenate_batches=True,
     )
-    structures = [base_structure] * n
+    structures = [base_structure.copy() for _ in range(n)]
 
     t0 = time.perf_counter()
     state = ts.initialize_state(structures, model.device, model.dtype)
@@ -222,7 +223,11 @@ def profile_ase_static(n: int, ase_atoms: typing.Any) -> AseStaticProfile:
         enable_cueq=False,
     )
     t0 = time.perf_counter()
-    ase_atoms_list = [ase_atoms.copy() for _ in range(n)]
+    adaptor = AseAtomsAdaptor()
+    ase_atoms_list = []
+    for i in range(n):
+        struct = adaptor.get_structure(ase_atoms)
+        ase_atoms_list.append(adaptor.get_atoms(perturb_structure(struct, index=i)))
     for at in ase_atoms_list:
         at.calc = ase_calc
     if device.type == "cuda":
@@ -242,6 +247,23 @@ def profile_ase_static(n: int, ase_atoms: typing.Any) -> AseStaticProfile:
         setup=t_setup,
         model_loop=t_loop,
         total=t_setup + t_loop,
+    )
+
+
+def perturb_structure(
+    structure: Structure, index: int, scale: float = 1e-5
+) -> Structure:
+    """Return a copy of the structure with infinitesimal random displacement (unique per index)."""
+    torch.manual_seed(index)
+    n_sites = len(structure)
+    noise = (torch.rand(n_sites, 3) * 2 - 1) * scale
+    new_frac = structure.frac_coords + noise.numpy()
+    return Structure(
+        structure.lattice,
+        structure.species_and_occu,
+        new_frac,
+        to_unit_cell=True,
+        coords_are_cartesian=False,
     )
 
 
