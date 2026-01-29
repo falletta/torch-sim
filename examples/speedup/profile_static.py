@@ -1,7 +1,9 @@
-"""Profile TorchSim static path for n in [1, 10, 100, 500]; plot breakdown and total time.
+"""Profile TorchSim and ASE static path for n in [1, 10, 100, 500];
+plot breakdown and total time.
 
 Run: uv run profile_static.py
-Output: profile_static.html (single file with all plots)
+Output: profile_static.html (single file with all plots;
+includes ASE total for comparison)
 """
 
 # %%
@@ -41,7 +43,7 @@ warnings.filterwarnings(
 )
 
 
-class StaticProfileResult(BaseModel):
+class TorchSimStaticProfile(BaseModel):
     """Timing breakdown for one static profile run."""
 
     initialize_state: float
@@ -59,11 +61,19 @@ class StaticProfileResult(BaseModel):
     n_batches: float
 
 
-def profile_torchsim_static(n: int, base_structure: typing.Any) -> StaticProfileResult:  # noqa: C901, PLR0915
+class AseStaticProfile(BaseModel):
+    """Timing breakdown for one ASE static profile run (same job as TorchSim)."""
+
+    setup: float  # copy atoms + attach calculator
+    model_loop: float  # get_potential_energy + get_forces + get_stress for each
+    total: float
+
+
+def profile_torchsim_static(n: int, base_structure: typing.Any) -> TorchSimStaticProfile:  # noqa: C901, PLR0915
     """Time initialize_state, load_states, and model loop separately for one n.
 
     Returns:
-        StaticProfileResult with timing fields.
+        TorchSimStaticProfile with timing fields.
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     loaded_model = mace_mp(
@@ -191,7 +201,7 @@ def profile_torchsim_static(n: int, base_structure: typing.Any) -> StaticProfile
     t_fwd = time.perf_counter() - t_fwd
     n_batches = len(batcher.index_bins)
 
-    return StaticProfileResult(
+    return TorchSimStaticProfile(
         initialize_state=t_init,
         load_states=t_load,
         load_states_split=t_load_split,
@@ -208,13 +218,50 @@ def profile_torchsim_static(n: int, base_structure: typing.Any) -> StaticProfile
     )
 
 
+def profile_ase_static(n: int, ase_atoms: typing.Any) -> AseStaticProfile:
+    """Time ASE static (same job as TorchSim): n structures, energy+forces+stress.
+
+    Uses the same MACE model and device as profile_torchsim_static for comparison.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ase_calc = mace_mp(
+        model=MaceUrls.mace_mpa_medium,
+        default_dtype="float64",
+        device=str(device),
+        enable_cueq=False,
+    )
+    t0 = time.perf_counter()
+    ase_atoms_list = [ase_atoms.copy() for _ in range(n)]
+    for at in ase_atoms_list:
+        at.calc = ase_calc
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t_setup = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    for at in ase_atoms_list:
+        at.get_potential_energy()
+        at.get_forces()
+        at.get_stress()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t_loop = time.perf_counter() - t0
+
+    return AseStaticProfile(
+        setup=t_setup,
+        model_loop=t_loop,
+        total=t_setup + t_loop,
+    )
+
+
 N_STRUCTURES = [1, 1, 10, 100, 500]
 
 
 def plot_profile_sweep(
-    timings_by_n: list[StaticProfileResult],
+    timings_by_n: list[TorchSimStaticProfile],
     n_list: list[int],
     output_path: str = "profile_static.html",
+    ase_timings_by_n: list[AseStaticProfile] | None = None,
 ) -> None:
     """Single HTML: main phases, load_states/model_loop breakdowns, total vs n."""
     phases = ["initialize_state", "load_states", "model_loop"]
@@ -316,11 +363,27 @@ def plot_profile_sweep(
             textposition="top center",
             line={"width": 2},
             marker={"size": 12},
-            name="total",
+            name="TorchSim total",
         ),
         row=4,
         col=1,
     )
+    if ase_timings_by_n is not None and len(ase_timings_by_n) == len(n_list):
+        ase_totals = [t.total for t in ase_timings_by_n]
+        fig.add_trace(
+            go.Scatter(
+                x=x_centers,
+                y=ase_totals,
+                mode="lines+markers+text",
+                text=[f"{t:.2f}s" for t in ase_totals],
+                textposition="bottom center",
+                line={"width": 2, "dash": "dash"},
+                marker={"size": 12, "symbol": "square"},
+                name="ASE total",
+            ),
+            row=4,
+            col=1,
+        )
 
     tickvals = dict(tickvals=x_centers, ticktext=[str(n) for n in n_list])
     for row in range(1, 5):
@@ -346,4 +409,10 @@ if __name__ == "__main__":
     timings_by_n = [
         profile_torchsim_static(n_val, base_structure) for n_val in N_STRUCTURES
     ]
-    plot_profile_sweep(timings_by_n, N_STRUCTURES, output_path="profile_static.html")
+    ase_timings_by_n = [profile_ase_static(n_val, mgo_ase) for n_val in N_STRUCTURES]
+    plot_profile_sweep(
+        timings_by_n,
+        N_STRUCTURES,
+        output_path="profile_static.html",
+        ase_timings_by_n=ase_timings_by_n,
+    )
