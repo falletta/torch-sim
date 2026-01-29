@@ -592,6 +592,10 @@ class BinningAutoBatcher[T: SimState]:
         self.batched_states = []
         for index_bin in self.index_bins:
             self.batched_states.append([self.state_slices[idx] for idx in index_bin])
+        # Pre-concatenate so next_batch() is O(1) instead of concatenating in the loop
+        self._concatenated_batches = [
+            ts.concatenate_states(state_bin) for state_bin in self.batched_states
+        ]
         self.current_state_bin = 0
 
         return self.max_memory_scaler
@@ -619,8 +623,7 @@ class BinningAutoBatcher[T: SimState]:
         # TODO: need to think about how this intersects with reporting too
         # TODO: definitely a clever treatment to be done with iterators here
         if self.current_state_bin < len(self.batched_states):
-            state_bin = self.batched_states[self.current_state_bin]
-            state = ts.concatenate_states(state_bin)
+            state = self._concatenated_batches[self.current_state_bin]
             indices = (
                 self.index_bins[self.current_state_bin]
                 if self.current_state_bin < len(self.index_bins)

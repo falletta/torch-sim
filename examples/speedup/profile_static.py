@@ -6,15 +6,6 @@ Output: profile_static.html (single file with all plots;
 includes ASE total for comparison)
 """
 
-# %%
-# /// script
-# dependencies = [
-#     "torch_sim_atomistic[mace,test]",
-#     "plotly",
-#     "pydantic",
-# ]
-# ///
-
 import time
 import typing
 import warnings
@@ -250,7 +241,7 @@ def profile_ase_static(n: int, ase_atoms: typing.Any) -> AseStaticProfile:
     )
 
 
-N_STRUCTURES = [1, 1, 10, 100, 500]
+N_STRUCTURES = [1, 1, 10, 100, 500, 1000, 1500]
 
 
 def plot_profile_sweep(
@@ -400,6 +391,8 @@ def plot_profile_sweep(
 
 
 if __name__ == "__main__":
+    # Ensure we're using the local batcher (pre-concatenation); check torch_sim location
+    print(f"torch_sim from: {ts.__file__}")
     mgo_ase = bulk(name="MgO", crystalstructure="rocksalt", a=4.21, cubic=True)
     base_structure = AseAtomsAdaptor.get_structure(atoms=mgo_ase)  # pyright: ignore[reportArgumentType]
     timings_by_n = [
