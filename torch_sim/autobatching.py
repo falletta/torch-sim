@@ -632,9 +632,14 @@ class BinningAutoBatcher[T: SimState]:
         )  # list[dict[original_index: int, memory_scale:float]]
         # Convert to list of lists of indices
         self.index_bins = [list(batch.keys()) for batch in self.index_bins]
-        self.batched_states = []
-        for index_bin in self.index_bins:
-            self.batched_states.append([self.state_slices[idx] for idx in index_bin])
+        # Build batches: one slice per bin from batched state (no single-system states)
+        if isinstance(states, SimState):
+            self.batched_states = [[states[index_bin]] for index_bin in self.index_bins]
+        else:
+            self.batched_states = [
+                [self.state_slices[idx] for idx in index_bin]
+                for index_bin in self.index_bins
+            ]
         # Optionally pre-concatenate so next_batch() is O(1); if False, only one batch
         # in memory at a time (concat on demand), avoiding extra memory pressure.
         if self.pre_concatenate_batches:

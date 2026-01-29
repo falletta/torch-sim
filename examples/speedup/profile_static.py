@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from pymatgen.io.ase import AseAtomsAdaptor
 
 import torch_sim as ts
-from torch_sim.autobatching import calculate_memory_scaler, to_constant_volume_bins
+from torch_sim.autobatching import calculate_memory_scalers, to_constant_volume_bins
 from torch_sim.models.mace import MaceModel, MaceUrls
 
 
@@ -85,6 +85,7 @@ def profile_torchsim_static(n: int, base_structure: typing.Any) -> TorchSimStati
         model=model,
         max_memory_scaler=400_000,
         memory_scales_with="n_atoms_x_density",
+        pre_concatenate_batches=True,
     )
     structures = [base_structure] * n
 
@@ -130,9 +131,8 @@ def profile_torchsim_static(n: int, base_structure: typing.Any) -> TorchSimStati
         torch.cuda.synchronize()
     t_load_split = time.perf_counter() - t0
     t0 = time.perf_counter()
-    memory_scalers = [
-        calculate_memory_scaler(s, batcher.memory_scales_with) for s in state_slices
-    ]
+    # Batched O(n_systems) path: no Python loop over slices, no position scan
+    memory_scalers = calculate_memory_scalers(state, batcher.memory_scales_with)
     if device.type == "cuda":
         torch.cuda.synchronize()
     t_load_scalers = time.perf_counter() - t0
@@ -142,7 +142,11 @@ def profile_torchsim_static(n: int, base_structure: typing.Any) -> TorchSimStati
         index_to_scaler, max_volume=batcher.max_memory_scaler
     )
     index_bins = [list(batch.keys()) for batch in index_bins]
-    _ = [[state_slices[i] for i in bin_idx] for bin_idx in index_bins]
+    # Mirror batcher: one slice per bin (state[index_bin]), no single-system states
+    if isinstance(state, ts.SimState):
+        _ = [state[index_bin] for index_bin in index_bins]
+    else:
+        _ = [[state_slices[i] for i in bin_idx] for bin_idx in index_bins]
     if device.type == "cuda":
         torch.cuda.synchronize()
     t_load_binning = time.perf_counter() - t0

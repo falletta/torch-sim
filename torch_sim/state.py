@@ -10,7 +10,7 @@ import typing
 from collections import defaultdict
 from collections.abc import Generator, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self, overload
 
 import torch
 
@@ -430,16 +430,16 @@ class SimState:
         """
         return ts.io.state_to_phonopy(self)
 
-    def split(self) -> list[Self]:
-        """Split the SimState into a list of single-system SimStates.
+    def split(self) -> Sequence[Self]:
+        """Split the SimState into a sequence of single-system SimStates (O(1)).
 
-        Divides the current state into separate states, each containing a single system,
-        preserving all properties appropriately for each system.
+        Each single-system state is created on first access (index or iteration),
+        so the call itself is O(1). Use like a list: len(s), s[i], for x in s.
 
         Returns:
-            list[SimState]: A list of SimState objects, one per system
+            Sequence[SimState]: A sequence of SimState objects, one per system
         """
-        return _split_state(self)
+        return _SplitStateList(self)  # type: ignore[return-value]
 
     def pop(self, system_indices: int | list[int] | slice | torch.Tensor) -> list[Self]:
         """Pop off states with the specified system indices.
@@ -813,6 +813,69 @@ def _filter_attrs_by_mask(
     return filtered_attrs
 
 
+def _get_system_slice[T: SimState](state: T, sys_idx: int) -> T:
+    """Return a single-system state for system sys_idx (O(atoms in that system)).
+
+    Used by lazy split so we never build all n_systems states up front.
+    """
+    n_systems = state.n_systems
+    if sys_idx < 0 or sys_idx >= n_systems:
+        raise IndexError(f"system index {sys_idx} out of range [0, {n_systems})")
+    zero_tensor = torch.tensor([0], device=state.device, dtype=torch.int64)
+    cumsum_atoms = torch.cat((zero_tensor, torch.cumsum(state.n_atoms_per_system, dim=0)))
+    start = cumsum_atoms[sys_idx].item()
+    end = cumsum_atoms[sys_idx + 1].item()
+    n_atoms_i = end - start
+
+    system_attrs: dict[str, Any] = {
+        "system_idx": torch.zeros(n_atoms_i, device=state.device, dtype=torch.int64),
+        **dict(get_attrs_for_scope(state, "global")),
+    }
+    for attr_name, attr_value in get_attrs_for_scope(state, "per-atom"):
+        if attr_name != "system_idx":
+            system_attrs[attr_name] = attr_value[start:end]
+    for attr_name, attr_value in get_attrs_for_scope(state, "per-system"):
+        if isinstance(attr_value, torch.Tensor):
+            system_attrs[attr_name] = attr_value[sys_idx : sys_idx + 1]
+        else:
+            system_attrs[attr_name] = attr_value
+
+    atom_idx = torch.arange(start, end, device=state.device)
+    new_constraints = [
+        new_constraint
+        for constraint in state.constraints
+        if (new_constraint := constraint.select_sub_constraint(atom_idx, sys_idx))
+    ]
+    system_attrs["_constraints"] = new_constraints
+    return type(state)(**system_attrs)  # type: ignore[invalid-argument-type]
+
+
+class _SplitStateList(Sequence[SimState]):
+    """Lazy sequence of single-system states; slice created on access (O(1) split)."""
+
+    def __init__(self, state: SimState) -> None:
+        self._state = state
+
+    def __len__(self) -> int:
+        return self._state.n_systems
+
+    @overload
+    def __getitem__(self, i: int) -> SimState: ...
+
+    @overload
+    def __getitem__(self, s: slice) -> list[SimState]: ...
+
+    def __getitem__(self, i: int | slice) -> SimState | list[SimState]:
+        if isinstance(i, slice):
+            start, stop, step = i.indices(len(self))
+            return [_get_system_slice(self._state, j) for j in range(start, stop, step)]
+        return _get_system_slice(self._state, i)
+
+    def __iter__(self) -> Generator[SimState, None, None]:
+        for j in range(len(self)):
+            yield _get_system_slice(self._state, j)
+
+
 def _split_state[T: SimState](state: T) -> list[T]:
     """Split a SimState into a list of states, each containing a single system.
 
@@ -826,58 +889,7 @@ def _split_state[T: SimState](state: T) -> list[T]:
         list[SimState]: A list of SimState objects, each containing a single
             system
     """
-    system_sizes = state.n_atoms_per_system.tolist()
-
-    split_per_atom = {}
-    for attr_name, attr_value in get_attrs_for_scope(state, "per-atom"):
-        if attr_name != "system_idx":
-            split_per_atom[attr_name] = torch.split(attr_value, system_sizes, dim=0)
-
-    split_per_system = {}
-    for attr_name, attr_value in get_attrs_for_scope(state, "per-system"):
-        if isinstance(attr_value, torch.Tensor):
-            split_per_system[attr_name] = torch.split(attr_value, 1, dim=0)
-        else:  # Non-tensor attributes are replicated for each split
-            split_per_system[attr_name] = [attr_value] * state.n_systems
-
-    global_attrs = dict(get_attrs_for_scope(state, "global"))
-
-    # Create a state for each system
-    states: list[T] = []
-    n_systems = len(system_sizes)
-    zero_tensor = torch.tensor([0], device=state.device, dtype=torch.int64)
-    cumsum_atoms = torch.cat((zero_tensor, torch.cumsum(state.n_atoms_per_system, dim=0)))
-    for sys_idx in range(n_systems):
-        system_attrs = {
-            # Create a system tensor with all zeros for this system
-            "system_idx": torch.zeros(
-                system_sizes[sys_idx], device=state.device, dtype=torch.int64
-            ),
-            # Add the split per-atom attributes
-            **{
-                attr_name: split_per_atom[attr_name][sys_idx]
-                for attr_name in split_per_atom
-            },
-            # Add the split per-system attributes
-            **{
-                attr_name: split_per_system[attr_name][sys_idx]
-                for attr_name in split_per_system
-            },
-            # Add the global attributes
-            **global_attrs,
-        }
-
-        atom_idx = torch.arange(cumsum_atoms[sys_idx], cumsum_atoms[sys_idx + 1])
-        new_constraints = [
-            new_constraint
-            for constraint in state.constraints
-            if (new_constraint := constraint.select_sub_constraint(atom_idx, sys_idx))
-        ]
-
-        system_attrs["_constraints"] = new_constraints
-        states.append(type(state)(**system_attrs))  # type: ignore[invalid-argument-type]
-
-    return states
+    return list(_SplitStateList(state))  # type: ignore[return-value]
 
 
 def _pop_states[T: SimState](
