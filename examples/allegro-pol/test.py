@@ -1,15 +1,15 @@
-"""Test the deployed allegro-pol SiO2 model on a quartz structure."""
+"""Test the deployed allegro-pol SiO2 model on a quartz structure via TorchSim."""
 
 from __future__ import annotations
 
 import torch
-from allegro_pol._keys import POLARIZABILITY_KEY
+import torch_sim as ts
 from ase.spacegroup import crystal
-from nequip.data import AtomicDataDict
-from nequip.integrations.ase import NequIPCalculator
+from pymatgen.io.ase import AseAtomsAdaptor
+from allegro_pol.integrations.torchsim import NequIPPolTorchSimCalc
 
-MODEL_PATH = "allegro-pol-SiO2.nequip.zip"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+MODEL_PATH = "allegro-pol-SiO2.nequip.pt2"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # Alpha-quartz SiO2 (spacegroup P3_121, 9 atoms: 3 Si + 6 O)
 atoms = crystal(
@@ -18,11 +18,14 @@ atoms = crystal(
     spacegroup=152,
     cellpar=[4.916, 4.916, 5.405, 90, 90, 120],
 )
+structure = AseAtomsAdaptor.get_structure(atoms)
 
-calc = NequIPCalculator._from_saved_model(model_path=MODEL_PATH, device=DEVICE)
+model = NequIPPolTorchSimCalc.from_compiled_model(
+    MODEL_PATH, device=DEVICE, chemical_species_to_atom_type_map=True
+)
 
-data = calc.atoms_to_data(atoms)
-out = calc.call_model(data)
+state = ts.initialize_state([structure], model.device, model.dtype)
+out = model(state)
 
 print("=== Model output keys ===")
 for key in sorted(out):
@@ -30,19 +33,16 @@ for key in sorted(out):
     if isinstance(val, torch.Tensor):
         print(f"  {key:30s}  shape={str(list(val.shape)):20s}  dtype={val.dtype}")
 
-energy = out[AtomicDataDict.TOTAL_ENERGY_KEY].detach().cpu().item()
-forces = out[AtomicDataDict.FORCE_KEY].detach().cpu().numpy()
+energy = out["energy"].cpu().item()
+forces = out["forces"].cpu().numpy()
 print(f"\nEnergy: {energy:.6f} eV")
 print(f"Forces (shape {forces.shape}):\n{forces}")
 
-if AtomicDataDict.POLARIZATION_KEY in out:
-    polarization = out[AtomicDataDict.POLARIZATION_KEY].detach().cpu().numpy()
-    print(f"\nPolarization (shape {polarization.shape}):\n{polarization}")
+if "stress" in out:
+    stress = out["stress"].cpu().numpy()
+    print(f"\nStress (shape {stress.shape}):\n{stress}")
 
-if AtomicDataDict.BORN_CHARGE_KEY in out:
-    born_charges = out[AtomicDataDict.BORN_CHARGE_KEY].detach().cpu().numpy()
-    print(f"\nBorn effective charges (shape {born_charges.shape}):\n{born_charges}")
-
-if POLARIZABILITY_KEY in out:
-    polarizability = out[POLARIZABILITY_KEY].detach().cpu().numpy()
-    print(f"\nPolarizability (shape {polarizability.shape}):\n{polarizability}")
+for extra_key in ("polarization", "born_charges", "polarizability"):
+    if extra_key in out:
+        val = out[extra_key].cpu().numpy()
+        print(f"\n{extra_key} (shape {val.shape}):\n{val}")
